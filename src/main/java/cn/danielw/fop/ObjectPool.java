@@ -14,17 +14,17 @@ public class ObjectPool<T> {
     private static final Logger logger = Logger.getLogger(ObjectPool.class.getCanonicalName());
 
     protected final PoolConfig config;
-    protected final ObjectFactory<T> factory;
+    protected final ObjectFactoryRaw<T> factory;
     protected final ObjectPoolPartition<T>[] partitions;
     protected Scavenger scavenger;
     protected volatile boolean shuttingDown;
     protected boolean isInit = false;
 
-    public ObjectPool(PoolConfig poolConfig, ObjectFactory<T> objectFactory) {
+    public ObjectPool(PoolConfig poolConfig, ObjectFactoryRaw<T> objectFactory) {
         this(poolConfig, objectFactory, true);
     }
 
-    public ObjectPool(PoolConfig poolConfig, ObjectFactory<T> objectFactory, boolean init) {
+    public ObjectPool(PoolConfig poolConfig, ObjectFactoryRaw<T> objectFactory, boolean init) {
         this.config = poolConfig;
         this.factory = objectFactory;
         this.partitions = new ObjectPoolPartition[config.getPartitionsCount()];
@@ -78,7 +78,8 @@ public class ObjectPool<T> {
     public Poolable<T> borrowObject(boolean noTimeout) {
         for (int i = 0; i < 3; i++) { // try at most three times
             Poolable<T> result = getObject(noTimeout);
-            if (factory.validate(result.getObject())) {
+            if (factory.validate(result)) {
+                factory.restore(result);
                 return result;
             } else {
                 logger.warning("Invalid object found in the pool, destroy it: " + result.getObject());
@@ -123,8 +124,64 @@ public class ObjectPool<T> {
         return freeObject;
     }
 
+    /**
+     * borrow a specific object if exists
+     * @return true if obj was removed from queue
+     */
+    public boolean borrowObject(Poolable<T> obj) {
+        if (partitions[obj.getPartition()].getObjectQueue().remove(obj)) {
+            factory.restore(obj);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * borrow a specific object or throw
+     * @throws IllegalStateException obj is not present in current pool
+     */
+    public void borrowObjectOrThrow(Poolable<T> obj) {
+        if (!borrowObject(obj)) {
+            throw new IllegalStateException();
+        }
+    }
+
+    /**
+     * remove object from pool if exists then destroy
+     * @return true if obj was removed from queue
+     */
+    public boolean decreaseObject(Poolable<T> obj) {
+        boolean exists = partitions[obj.getPartition()].getObjectQueue().remove(obj);
+        partitions[obj.getPartition()].decreaseObject(obj);
+        return exists;
+    }
+
+    /**
+     * remove object from pool and destroy only if exists
+     * @return true if obj was removed from queue
+     */
+    public boolean decreaseObjectIfExists(Poolable<T> obj) {
+        if (partitions[obj.getPartition()].getObjectQueue().remove(obj)) {
+            partitions[obj.getPartition()].decreaseObject(obj);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * remove object from pool if exists then destroy or throw
+     * @throws IllegalStateException obj is not present in current pool
+     */
+    public void decreaseObjectIfExistsElseThrow(Poolable<T> obj) {
+        if( !partitions[obj.getPartition()].getObjectQueue().remove(obj) ) {
+            throw new IllegalStateException();
+        }
+        partitions[obj.getPartition()].decreaseObject(obj);
+    }
+
     @SuppressWarnings({"java:S112", "java:S2142"})
     public void returnObject(Poolable<T> obj) {
+        factory.recycle(obj);
         ObjectPoolPartition<T> subPool = this.partitions[obj.getPartition()];
         try {
             subPool.getObjectQueue().put(obj);
@@ -142,6 +199,10 @@ public class ObjectPool<T> {
             size += subPool.getTotalCount();
         }
         return size;
+    }
+
+    public int getMaxSize() {
+        return config.getPartitionsCount()*config.getMaxPartitionSize();
     }
 
     public synchronized int shutdown() throws InterruptedException {
